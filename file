@@ -1,0 +1,166 @@
+"""
+Rainfall-Runoff Modeling using Hydrological ML Models (synthetic data)
+
+Saves:
+ - /mnt/data/rainfall_runoff_synthetic.csv
+ - /mnt/data/observed_vs_predicted.png
+ - /mnt/data/training_report.txt
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+def generate_synthetic_data(n=500, random_state=42):
+    """Generates synthetic rainfall-runoff dataset with n samples (n >= 100)."""
+    np.random.seed(random_state)
+    # Inputs
+    rainfall = np.random.gamma(shape=2.0, scale=10.0, size=n)          # mm/day-like
+    temp = np.random.normal(loc=25, scale=5, size=n)                   # °C
+    soil_moisture = np.clip(np.random.normal(loc=0.25, scale=0.1, size=n), 0, 1)  # fraction
+    evapotranspiration = np.clip(0.1 * temp + np.random.normal(scale=1.0, size=n), 0, None) # mm/day
+
+    # Antecedent Precipitation Index (API) - simple decay
+    api = np.zeros(n)
+    decay = 0.7
+    for i in range(1, n):
+        api[i] = decay * api[i-1] + rainfall[i-1]
+
+    # Nonlinear runoff generation with seasonality and noise
+    base_runoff = 0.05 * rainfall**1.2 + 20 * soil_moisture * (rainfall / (rainfall + 10)) + 0.01 * api
+    seasonal_factor = 1.0 + 0.2 * np.sin(np.linspace(0, 2 * np.pi, n))  # seasonal cycle
+    noise = np.random.normal(scale=2.0 + 0.02 * rainfall, size=n)
+    runoff = np.maximum(0, base_runoff * seasonal_factor - 0.5 * evapotranspiration + noise)
+
+    df = pd.DataFrame({
+        "rainfall_mm": np.round(rainfall, 3),
+        "temperature_C": np.round(temp, 3),
+        "soil_moisture": np.round(soil_moisture, 3),
+        "evapotranspiration_mm": np.round(evapotranspiration, 3),
+        "API": np.round(api, 3),
+        "runoff_mm": np.round(runoff, 3)
+    })
+    return df
+
+def train_and_evaluate(df, out_dir="/mnt/data"):
+    """Train models and save outputs. Returns results dict."""
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+
+    features = ["rainfall_mm", "temperature_C", "soil_moisture", "evapotranspiration_mm", "API"]
+    X = df[features].values
+    y = df["runoff_mm"].values
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    models = {
+        "LinearRegression": Pipeline([("scaler", StandardScaler()), ("lr", LinearRegression())]),
+        "RandomForest": RandomForestRegressor(n_estimators=200, random_state=42),
+        "GradientBoosting": GradientBoostingRegressor(n_estimators=200, learning_rate=0.1, random_state=42)
+    }
+
+    results = {}
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        pred = model.predict(X_test)
+        rmse = mean_squared_error(y_test, pred, squared=False)
+        mae = mean_absolute_error(y_test, pred)
+        r2 = r2_score(y_test, pred)
+        results[name] = {"rmse": rmse, "mae": mae, "r2": r2, "pred": pred}
+
+    # Save dataset
+    csv_path = os.path.join(out_dir, "rainfall_runoff_synthetic.csv")
+    df.to_csv(csv_path, index=False)
+
+    # Summarize performance
+    perf_df = pd.DataFrame({k: {"RMSE": v["rmse"], "MAE": v["mae"], "R2": v["r2"]} for k, v in results.items()}).T
+    print("\nModel performance:\n", perf_df)
+
+    best_model_name = perf_df["RMSE"].idxmin()
+    print(f"\nBest model by RMSE: {best_model_name}")
+
+    # Plot observed vs predicted
+    y_test_sorted_idx = np.argsort(y_test)
+    y_test_sorted = y_test[y_test_sorted_idx]
+    best_pred = results[best_model_name]["pred"][y_test_sorted_idx]
+
+    plt.figure(figsize=(8,6))
+    plt.scatter(y_test, results[best_model_name]["pred"], alpha=0.8)
+    minv, maxv = min(y_test.min(), results[best_model_name]["pred"].min()), max(y_test.max(), results[best_model_name]["pred"].max())
+    plt.plot([minv, maxv], [minv, maxv], linestyle="--")
+    plt.xlabel("Observed runoff (mm)")
+    plt.ylabel("Predicted runoff (mm)")
+    plt.title(f"Observed vs Predicted - {best_model_name}")
+    plt.grid(True)
+    plot_path = os.path.join(out_dir, "observed_vs_predicted.png")
+    plt.tight_layout()
+    plt.savefig(plot_path)
+    plt.close()
+
+    # Feature importances for tree-based models (if applicable)
+    fi_path = None
+    if best_model_name in ["RandomForest", "GradientBoosting"]:
+        model_obj = models[best_model_name]
+        importances = model_obj.feature_importances_
+        feat_imp = pd.Series(importances, index=features).sort_values(ascending=False)
+        print("\nFeature importances:\n", feat_imp)
+        plt.figure(figsize=(8,4))
+        feat_imp.plot(kind="bar")
+        plt.xlabel("Feature")
+        plt.ylabel("Importance")
+        plt.title(f"Feature importances - {best_model_name}")
+        fi_path = os.path.join(out_dir, "feature_importances.png")
+        plt.tight_layout()
+        plt.savefig(fi_path)
+        plt.close()
+
+    # Save a short report
+    report_path = os.path.join(out_dir, "training_report.txt")
+    with open(report_path, "w") as f:
+        f.write("Rainfall-Runoff Modeling - Training Report\n")
+        f.write("==============================\n\n")
+        f.write(f"Dataset saved to: {csv_path}\n")
+        f.write(f"Best model: {best_model_name}\n\n")
+        f.write("Performance:\n")
+        f.write(perf_df.to_string())
+        f.write("\n")
+        if fi_path:
+            f.write(f"\nFeature importances saved to: {fi_path}\n")
+        f.write(f"\nObserved vs Predicted plot saved to: {plot_path}\n")
+
+    return {
+        "performance": perf_df,
+        "best_model": best_model_name,
+        "csv": csv_path,
+        "plot": plot_path,
+        "feature_importances": fi_path,
+        "report": report_path
+    }
+
+def main():
+    # Generate data (n >= 100)
+    df = generate_synthetic_data(n=500, random_state=42)
+    print("Generated synthetic dataset (first 5 rows):")
+    print(df.head())
+
+    # Train and evaluate
+    out_dir = "/mnt/data"  # adjust if you want different location
+    results = train_and_evaluate(df, out_dir=out_dir)
+
+    print("\nSaved files:")
+    print("CSV:", results["csv"])
+    print("Plot:", results["plot"])
+    print("Report:", results["report"])
+    if results["feature_importances"]:
+        print("Feature importances plot:", results["feature_importances"])
+
+if __name__ == "__main__":
+    main()
